@@ -17,7 +17,7 @@ D1_NAME = "zeus-db-eu7n21"
 EXPECTED_SUBDOMAIN = "freebirds22"
 # Paste a fresh BotFather token here. Never reuse a token shared in chat.
 # Environment variable takes precedence if set.
-TELEGRAM_BOT_TOKEN = "PASTE_NEW_BOTFATHER_TOKEN_HERE"
+TELEGRAM_BOT_TOKEN = "8926130639:AAH0qfCiDiQDijulW8n4mnhUhwoRRm8_Vsg"
 # Optional D1 username for a ready-to-click subscription link.
 # Leave blank to show the URL pattern without assuming a username.
 SUBSCRIPTION_USERNAME = ""
