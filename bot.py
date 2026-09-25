@@ -202,11 +202,13 @@ def is_admin(update: Update) -> bool:
 
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔐 وارد کردن Cloudflare API Token", callback_data="token")],
         [InlineKeyboardButton("🚀 Deploy", callback_data="deploy")],
-        [InlineKeyboardButton("♻️ حذف و Redeploy", callback_data="redeploy")],
-        [InlineKeyboardButton("🗄 مدیریت", callback_data="dbmenu")],
+        [
+            InlineKeyboardButton("🔐 وارد کردن Cloudflare API Token", callback_data="token"),
+            InlineKeyboardButton("🗑 Delete Panel", callback_data="delete"),
+        ],
         [InlineKeyboardButton("🧹 پاک کردن Token", callback_data="forget")],
+        [InlineKeyboardButton("🗄 مدیریت", callback_data="dbmenu")],
     ])
 
 
@@ -307,16 +309,9 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
         exists = await cf.script_exists(str(account["id"]))
         if action == "deploy" and exists:
             await q.edit_message_text(
-                f"Worker `{SCRIPT_NAME}` از قبل وجود دارد. برای جلوگیری از overwrite ناخواسته، Deploy انجام نشد؛ از دکمهٔ Redeploy استفاده کن.",
+                f"Worker `{SCRIPT_NAME}` از قبل وجود دارد. اول از دکمهٔ Delete Panel حذفش کن، بعد دوباره Deploy بزن.",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("♻️ حذف و Redeploy", callback_data="redeploy")]]),
-            )
-            return
-        if action == "redeploy" and not exists:
-            await q.edit_message_text(
-                f"Worker `{SCRIPT_NAME}` هنوز وجود ندارد. از Deploy استفاده کن، نه Redeploy.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Deploy", callback_data="deploy")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Delete Panel", callback_data="delete")]]),
             )
             return
         PENDING[q.from_user.id] = {
@@ -325,7 +320,6 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
             "database_id": matches[0]["uuid"], "database_name": D1_NAME,
             "subdomain": account_subdomain,
         }
-        verb = "حذف کامل Worker موجود و ساخت دوباره" if action == "redeploy" else "ساخت و دیپلوی Worker"
         subscription_path = (
             f"/sub/{SUBSCRIPTION_USERNAME}"
             if SUBSCRIPTION_USERNAME
@@ -335,17 +329,49 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
             [InlineKeyboardButton("✅ تأیید", callback_data=f"confirm:{action}"), InlineKeyboardButton("لغو", callback_data="cancel")]
         ])
         await q.edit_message_text(
-            f"{verb}: `{SCRIPT_NAME}`\nاکانت: {account.get('name', 'Cloudflare')}\n"
+            f"ساخت و دیپلوی Worker: `{SCRIPT_NAME}`\nاکانت: {account.get('name', 'Cloudflare')}\n"
             f"D1: `{D1_NAME}` با Binding به نام `DB`\n"
             f"الگوی لینک اشتراک: `https://{SCRIPT_NAME}.{account_subdomain}.workers.dev{subscription_path}`\n\n"
-            + ("حذف Worker می‌تواند چند لحظه قطعی ایجاد کند؛ داده‌های D1 حذف نمی‌شود." if action == "redeploy" else "")
-            + "\nادامه بدهم؟",
+            "ادامه بدهم؟",
             parse_mode="Markdown", reply_markup=keyboard,
         )
     except CloudflareError as e:
         await q.edit_message_text(f"Cloudflare رد کرد: {e}")
     except Exception:
         await q.edit_message_text("بررسی Cloudflare ناموفق بود. توکن، دسترسی‌ها و اتصال را بررسی کن.")
+    finally:
+        await cf.close()
+
+
+async def prepare_delete_account(update: Update, account: dict[str, Any], token: str):
+    q = update.callback_query
+    cf = Cloudflare(token)
+    try:
+        exists = await cf.script_exists(str(account["id"]))
+        if not exists:
+            await q.edit_message_text(
+                f"Worker `{SCRIPT_NAME}` وجود ندارد؛ چیزی برای حذف نیست.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Deploy", callback_data="deploy")]]),
+            )
+            return
+        PENDING[q.from_user.id] = {
+            "action": "delete", "token": token, "account_id": str(account["id"]),
+            "account_name": account.get("name", "Cloudflare account"),
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ تأیید حذف", callback_data="confirm:delete"), InlineKeyboardButton("لغو", callback_data="cancel")]
+        ])
+        await q.edit_message_text(
+            f"حذف Worker: `{SCRIPT_NAME}`\nاکانت: {account.get('name', 'Cloudflare')}\n\n"
+            "فقط خود Worker حذف می‌شود؛ دیتابیس D1 دست‌نخورده می‌ماند. برای ساخت دوباره بعداً از Deploy استفاده کن.\n\n"
+            "ادامه بدهم؟",
+            parse_mode="Markdown", reply_markup=keyboard,
+        )
+    except CloudflareError as e:
+        await q.edit_message_text(f"Cloudflare رد کرد: {e}")
+    except Exception:
+        await q.edit_message_text("بررسی Cloudflare ناموفق بود.")
     finally:
         await cf.close()
 
@@ -417,7 +443,10 @@ async def begin_deployment(update: Update, action: str):
             await q.edit_message_text("این توکن به هیچ اکانتی دسترسی ندارد.")
             return
         if len(accounts) == 1:
-            await prepare_account(update, accounts[0], action, token)
+            if action == "delete":
+                await prepare_delete_account(update, accounts[0], token)
+            else:
+                await prepare_account(update, accounts[0], action, token)
         else:
             rows = [[InlineKeyboardButton(str(a.get("name", "Account"))[:50], callback_data=f"account:{action}:{a['id']}")] for a in accounts]
             await q.edit_message_text("اکانت Cloudflare را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
@@ -478,7 +507,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("مدیریت دیتابیس D1:", reply_markup=db_menu_keyboard())
     elif data == "db_back":
         await q.edit_message_text("𝑯𝒖𝒔𝒕𝒆𝑹𝑰𝑿 deploy bot", reply_markup=main_keyboard())
-    elif data in ("deploy", "redeploy"):
+    elif data in ("deploy", "delete"):
         await begin_deployment(update, data)
     elif data in ("db_backup", "db_restore"):
         await begin_db_action(update, data)
@@ -497,7 +526,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         finally:
             await cf.close()
-        await prepare_account(update, account, action, token)
+        if action == "delete":
+            await prepare_delete_account(update, account, token)
+        else:
+            await prepare_account(update, account, action, token)
     elif data.startswith("dbaccount:"):
         _, action, account_id = data.split(":", 2)
         token = TOKENS.get(uid)
@@ -522,29 +554,35 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cf = Cloudflare(plan["token"])
         try:
-            await q.edit_message_text("در حال انجام عملیات Cloudflare…")
-            if action == "redeploy":
+            if action == "delete":
+                await q.edit_message_text("در حال حذف Worker…")
                 await cf.delete_script(plan["account_id"])
-            await cf.deploy(plan["account_id"], plan["database_id"])
-            if SUBSCRIPTION_USERNAME:
-                link = f"https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev/sub/{SUBSCRIPTION_USERNAME}"
-                result = f"✅ HusteRIX Worker دیپلوی شد.\n[باز کردن لینک اشتراک]({link})"
-            else:
-                result = (
-                    "✅ HusteRIX Worker دیپلوی شد.\n"
-                    f"آدرس پایه: `https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev`\n"
-                    f"الگوی اشتراک: `https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev/sub/USERNAME_IN_D1`"
+                await q.edit_message_text(
+                    f"✅ Worker `{SCRIPT_NAME}` حذف شد.\nبرای ساخت دوباره از دکمهٔ Deploy استفاده کن.",
+                    parse_mode="Markdown", reply_markup=main_keyboard(),
                 )
-            await q.edit_message_text(
-                result + "\n\n"
-                "USERNAME_IN_D1 باید نام کاربری واقعیِ موجود در D1 باشد؛ نام ورود پنل یا تلگرام نیست.",
-                parse_mode="Markdown", reply_markup=main_keyboard(), disable_web_page_preview=True,
-            )
+            else:
+                await q.edit_message_text("در حال انجام عملیات Cloudflare…")
+                await cf.deploy(plan["account_id"], plan["database_id"])
+                if SUBSCRIPTION_USERNAME:
+                    link = f"https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev/sub/{SUBSCRIPTION_USERNAME}"
+                    result = f"✅ HusteRIX Worker دیپلوی شد.\n[باز کردن لینک اشتراک]({link})"
+                else:
+                    result = (
+                        "✅ HusteRIX Worker دیپلوی شد.\n"
+                        f"آدرس پایه: `https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev`\n"
+                        f"الگوی اشتراک: `https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev/sub/USERNAME_IN_D1`"
+                    )
+                await q.edit_message_text(
+                    result + "\n\n"
+                    "USERNAME_IN_D1 باید نام کاربری واقعیِ موجود در D1 باشد؛ نام ورود پنل یا تلگرام نیست.",
+                    parse_mode="Markdown", reply_markup=main_keyboard(), disable_web_page_preview=True,
+                )
         except CloudflareError as e:
-            prefix = "Worker حذف شد اما دیپلوی کامل نشد. " if action == "redeploy" else ""
-            await q.edit_message_text(f"❌ {prefix}Cloudflare: {e}", reply_markup=main_keyboard())
+            label = "حذف Worker" if action == "delete" else "Cloudflare"
+            await q.edit_message_text(f"❌ {label}: {e}", reply_markup=main_keyboard())
         except Exception:
-            await q.edit_message_text("❌ عملیات کامل نشد. اگر Redeploy بود، در داشبورد بررسی کن Worker حذف نشده باشد.", reply_markup=main_keyboard())
+            await q.edit_message_text("❌ عملیات کامل نشد.", reply_markup=main_keyboard())
         finally:
             PENDING.pop(uid, None)
             await cf.close()
