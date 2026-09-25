@@ -20,14 +20,14 @@ EXPECTED_SUBDOMAIN = "freebirds22"
 TELEGRAM_BOT_TOKEN = "8926130639:AAH0qfCiDiQDijulW8n4mnhUhwoRRm8_Vsg"
 # Optional D1 username for a ready-to-click subscription link.
 # Leave blank to show the URL pattern without assuming a username.
-SUBSCRIPTION_USERNAME = ""
+SUBSCRIPTION_USERNAME = "Ali"
 WORKER_FILE = Path(__file__).with_name("worker.js")
 
 # Secrets are intentionally kept in process memory only and are lost on restart.
 TOKENS: dict[int, str] = {}
 WAITING_FOR_TOKEN: set[int] = set()
 PENDING: dict[int, dict[str, Any]] = {}
-ADMIN_ID = int(os.environ.get("TELEGRAM_ADMIN_ID", "0"))
+ADMIN_ID = int(os.environ.get("TELEGRAM_ADMIN_ID", "7727625618"))
 
 
 class CloudflareError(Exception):
