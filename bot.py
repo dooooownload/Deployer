@@ -501,11 +501,21 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("لغو شد.", reply_markup=main_keyboard())
 
 
+async def clear_webhook(app: Application) -> None:
+    # A leftover webhook (from a previous deploy, a crash-restart race, or
+    # manual testing) blocks get_updates with a Conflict error. Clearing it
+    # on every startup makes polling self-healing.
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+
 def main():
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN).strip()
     if not bot_token or ADMIN_ID <= 0:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID first.")
-    app = Application.builder().token(bot_token).build()
+    app = Application.builder().token(bot_token).post_init(clear_webhook).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
