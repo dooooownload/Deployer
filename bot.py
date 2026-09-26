@@ -26,12 +26,9 @@ API = "https://api.cloudflare.com/client/v4"
 SCRIPT_NAME = "husterix"
 D1_NAME = "zeus-db-eu7n21"
 EXPECTED_SUBDOMAIN = "freebirds22"
-# The bot token comes only from the TELEGRAM_BOT_TOKEN environment variable
-# (see main()) — intentionally no hardcoded fallback in the source. If two
-# deployments ever ran with the same token, both would poll get_updates and
-# permanently Conflict-loop each other (each kicking the other's connection,
-# which looks like every button randomly "not working"). Requiring the env
-# var makes that class of bug impossible.
+# Paste a fresh BotFather token here. Never reuse a token shared in chat.
+# Environment variable takes precedence if set.
+TELEGRAM_BOT_TOKEN = "8926130639:AAEmkjqRcRXrB2ema7X4saiwymIDFGJzQiI"
 # Optional D1 username for a ready-to-click subscription link.
 # Leave blank to show the URL pattern without assuming a username.
 SUBSCRIPTION_USERNAME = ""
@@ -547,15 +544,9 @@ async def clear_webhook(app: Application) -> None:
 
 
 def main():
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if not bot_token:
-        raise SystemExit(
-            "TELEGRAM_BOT_TOKEN env var is not set. Set it on the host running "
-            "this bot (Railway → Variables) — no hardcoded fallback on purpose, "
-            "to avoid two deployments ever sharing one token."
-        )
-    if ADMIN_ID <= 0:
-        raise SystemExit("Set TELEGRAM_ADMIN_ID first.")
+    bot_token = TELEGRAM_BOT_TOKEN.strip()
+    if not bot_token or ADMIN_ID <= 0:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID first.")
     app = Application.builder().token(bot_token).post_init(clear_webhook).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
