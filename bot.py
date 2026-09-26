@@ -1,15 +1,26 @@
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
     MessageHandler, filters,
 )
+
+# Without this, python-telegram-bot stays almost silent: no per-update logs,
+# and even unhandled exceptions may not reach the Railway log stream.
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger("husterix-bot")
 
 API = "https://api.cloudflare.com/client/v4"
 SCRIPT_NAME = "husterix"
@@ -131,6 +142,29 @@ class Cloudflare:
         )
 
 
+async def safe_edit(q, text: str, **kwargs) -> None:
+    """Wraps callback_query.edit_message_text so one bad edit can't silently
+    kill the rest of the handler (which is what made buttons look "stuck" -
+    the tap was received and processed, but the reply never rendered and
+    nothing was logged)."""
+    try:
+        await q.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return  # harmless: double-tap or identical re-render
+        logger.exception("edit_message_text failed (BadRequest): %s", e)
+        try:
+            await q.message.reply_text(text, **kwargs)
+        except Exception:
+            logger.exception("fallback reply_text also failed")
+    except Exception:
+        logger.exception("edit_message_text failed unexpectedly")
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception while processing update: %s", update, exc_info=context.error)
+
+
 def is_admin(update: Update) -> bool:
     user = update.effective_user
     chat = update.effective_chat
@@ -185,7 +219,7 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
         dbs = await cf.databases(str(account["id"]))
         matches = [db for db in dbs if db.get("name") == D1_NAME]
         if len(matches) != 1:
-            await q.edit_message_text(
+            await safe_edit(q, 
                 f"دیتابیس دقیقاً یک مورد پیدا نشد: `{D1_NAME}`. "
                 "مطمئن شو اسم D1 در همین اکانت است و توکن دسترسی D1 Read دارد.",
                 parse_mode="Markdown",
@@ -194,7 +228,7 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
         account_subdomain = await cf.subdomain(str(account["id"]))
         if account_subdomain != EXPECTED_SUBDOMAIN:
             actual = f"{SCRIPT_NAME}.{account_subdomain}.workers.dev" if account_subdomain else "workers.dev برای این اکانت تنظیم نشده"
-            await q.edit_message_text(
+            await safe_edit(q, 
                 f"برای اینکه لینک درخواستی دقیقاً ساخته شود، زیردامنهٔ اکانت باید `{EXPECTED_SUBDOMAIN}.workers.dev` باشد.\n"
                 f"الان: `{actual}`\n"
                 "زیردامنه را از داشبورد Cloudflare تنظیم کن، بعد دوباره تلاش کن. ربات آن را خودکار عوض نمی‌کند.",
@@ -203,7 +237,7 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
             return
         exists = await cf.script_exists(str(account["id"]))
         if exists:
-            await q.edit_message_text(
+            await safe_edit(q, 
                 f"Worker `{SCRIPT_NAME}` از قبل وجود دارد. اول از داخل 🗄 Manage Panel حذفش کن، بعد دوباره Deploy بزن.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🗄 Manage Panel", callback_data="manage")]]),
@@ -223,7 +257,7 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ تأیید", callback_data=f"confirm:{action}"), InlineKeyboardButton("لغو", callback_data="cancel")]
         ])
-        await q.edit_message_text(
+        await safe_edit(q, 
             f"ساخت و دیپلوی Worker: `{SCRIPT_NAME}`\nاکانت: {account.get('name', 'Cloudflare')}\n"
             f"D1: `{D1_NAME}` با Binding به نام `DB`\n"
             f"الگوی لینک اشتراک: `https://{SCRIPT_NAME}.{account_subdomain}.workers.dev{subscription_path}`\n\n"
@@ -231,9 +265,9 @@ async def prepare_account(update: Update, account: dict[str, Any], action: str, 
             parse_mode="Markdown", reply_markup=keyboard,
         )
     except CloudflareError as e:
-        await q.edit_message_text(f"Cloudflare رد کرد: {e}")
+        await safe_edit(q, f"Cloudflare رد کرد: {e}")
     except Exception:
-        await q.edit_message_text("بررسی Cloudflare ناموفق بود. توکن، دسترسی‌ها و اتصال را بررسی کن.")
+        await safe_edit(q, "بررسی Cloudflare ناموفق بود. توکن، دسترسی‌ها و اتصال را بررسی کن.")
     finally:
         await cf.close()
 
@@ -242,25 +276,24 @@ async def begin_deployment(update: Update):
     q = update.callback_query
     token = TOKENS.get(q.from_user.id)
     if not token:
-        await q.answer("اول از Set New Api توکن را وارد کن.", show_alert=True)
-        await q.edit_message_text("از دکمهٔ زیر برای وارد کردن توکن استفاده کن.", reply_markup=main_keyboard())
+        await safe_edit(q, "اول از دکمهٔ Set New Api توکن Cloudflare را وارد کن.", reply_markup=main_keyboard())
         return
     cf = Cloudflare(token)
     try:
         await cf.request("GET", "/user/tokens/verify")
         accounts = await cf.accounts()
         if not accounts:
-            await q.edit_message_text("این توکن به هیچ اکانتی دسترسی ندارد.")
+            await safe_edit(q, "این توکن به هیچ اکانتی دسترسی ندارد.")
             return
         if len(accounts) == 1:
             await prepare_account(update, accounts[0], "deploy", token)
         else:
             rows = [[InlineKeyboardButton(str(a.get("name", "Account"))[:50], callback_data=f"account:deploy:{a['id']}")] for a in accounts]
-            await q.edit_message_text("اکانت Cloudflare را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
+            await safe_edit(q, "اکانت Cloudflare را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
     except CloudflareError as e:
-        await q.edit_message_text(f"اعتبارسنجی یا خواندن اکانت‌ها ناموفق بود: {e}")
+        await safe_edit(q, f"اعتبارسنجی یا خواندن اکانت‌ها ناموفق بود: {e}")
     except Exception:
-        await q.edit_message_text("ارتباط با Cloudflare ناموفق بود؛ دوباره امتحان کن.")
+        await safe_edit(q, "ارتباط با Cloudflare ناموفق بود؛ دوباره امتحان کن.")
     finally:
         await cf.close()
 
@@ -270,21 +303,20 @@ async def begin_manage(update: Update):
     uid = q.from_user.id
     token = TOKENS.get(uid)
     if not token:
-        await q.answer("اول از Set New Api توکن را وارد کن.", show_alert=True)
-        await q.edit_message_text("از دکمهٔ زیر برای وارد کردن توکن استفاده کن.", reply_markup=main_keyboard())
+        await safe_edit(q, "اول از دکمهٔ Set New Api توکن Cloudflare را وارد کن.", reply_markup=main_keyboard())
         return
     cf = Cloudflare(token)
     try:
         await cf.request("GET", "/user/tokens/verify")
         accounts = await cf.accounts()
         if not accounts:
-            await q.edit_message_text("این توکن به هیچ اکانتی دسترسی ندارد.", reply_markup=main_keyboard())
+            await safe_edit(q, "این توکن به هیچ اکانتی دسترسی ندارد.", reply_markup=main_keyboard())
             return
     except CloudflareError as e:
-        await q.edit_message_text(f"اعتبارسنجی یا خواندن اکانت‌ها ناموفق بود: {e}", reply_markup=main_keyboard())
+        await safe_edit(q, f"اعتبارسنجی یا خواندن اکانت‌ها ناموفق بود: {e}", reply_markup=main_keyboard())
         return
     except Exception:
-        await q.edit_message_text("ارتباط با Cloudflare ناموفق بود؛ دوباره امتحان کن.", reply_markup=main_keyboard())
+        await safe_edit(q, "ارتباط با Cloudflare ناموفق بود؛ دوباره امتحان کن.", reply_markup=main_keyboard())
         return
     finally:
         await cf.close()
@@ -294,7 +326,7 @@ async def begin_manage(update: Update):
     else:
         rows = [[InlineKeyboardButton(str(a.get("name", "Account"))[:50], callback_data=f"manageaccount:{a['id']}")] for a in accounts]
         rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="manageback")])
-        await q.edit_message_text("اکانت Cloudflare را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
+        await safe_edit(q, "اکانت Cloudflare را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def show_worker_list(update: Update, account_id: str, token: str):
@@ -305,10 +337,10 @@ async def show_worker_list(update: Update, account_id: str, token: str):
     try:
         scripts = await cf.list_scripts(account_id)
     except CloudflareError as e:
-        await q.edit_message_text(f"Cloudflare رد کرد: {e}", reply_markup=main_keyboard())
+        await safe_edit(q, f"Cloudflare رد کرد: {e}", reply_markup=main_keyboard())
         return
     except Exception:
-        await q.edit_message_text("خواندن لیست Worker ها ناموفق بود.", reply_markup=main_keyboard())
+        await safe_edit(q, "خواندن لیست Worker ها ناموفق بود.", reply_markup=main_keyboard())
         return
     finally:
         await cf.close()
@@ -320,7 +352,7 @@ async def show_worker_list(update: Update, account_id: str, token: str):
     }
 
     if not scripts:
-        await q.edit_message_text(
+        await safe_edit(q, 
             "هیچ Worker ای روی این اکانت دیپلوی نشده.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="manageback")]]),
         )
@@ -331,7 +363,7 @@ async def show_worker_list(update: Update, account_id: str, token: str):
         for s in scripts
     ]
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="manageback")])
-    await q.edit_message_text(
+    await safe_edit(q, 
         f"Worker های دیپلوی‌شده روی این اکانت ({len(scripts)}):",
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -348,14 +380,14 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "token":
         WAITING_FOR_TOKEN.add(uid)
-        await q.edit_message_text("توکن Cloudflare را در همین گفت‌وگوی خصوصی بفرست. پیام توکن بعد از دریافت حذف می‌شود.")
+        await safe_edit(q, "توکن Cloudflare را در همین گفت‌وگوی خصوصی بفرست. پیام توکن بعد از دریافت حذف می‌شود.")
 
     elif data == "forget":
         TOKENS.pop(uid, None)
         PENDING.pop(uid, None)
         MANAGE_CACHE.pop(uid, None)
         WAITING_FOR_TOKEN.discard(uid)
-        await q.edit_message_text("توکن و اطلاعات موقت پاک شد.", reply_markup=main_keyboard())
+        await safe_edit(q, "توکن و اطلاعات موقت پاک شد.", reply_markup=main_keyboard())
 
     elif data == "deploy":
         await begin_deployment(update)
@@ -364,20 +396,20 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await begin_manage(update)
 
     elif data == "manageback":
-        await q.edit_message_text("𝑯𝒖𝒔𝒕𝒆𝑹𝑰𝑿 deploy bot", reply_markup=main_keyboard())
+        await safe_edit(q, "𝑯𝒖𝒔𝒕𝒆𝑹𝑰𝑿 deploy bot", reply_markup=main_keyboard())
 
     elif data.startswith("account:"):
         _, action, account_id = data.split(":", 2)
         token = TOKENS.get(uid)
         if not token:
-            await q.edit_message_text("توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
+            await safe_edit(q, "توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
             return
         cf = Cloudflare(token)
         try:
             accounts = await cf.accounts()
             account = next((a for a in accounts if str(a.get("id")) == account_id), None)
             if not account:
-                await q.edit_message_text("اکانت انتخاب‌شده دیگر در دسترس نیست.")
+                await safe_edit(q, "اکانت انتخاب‌شده دیگر در دسترس نیست.")
                 return
         finally:
             await cf.close()
@@ -387,7 +419,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account_id = data.split(":", 1)[1]
         token = TOKENS.get(uid)
         if not token:
-            await q.edit_message_text("توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
+            await safe_edit(q, "توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
             return
         await show_worker_list(update, account_id, token)
 
@@ -395,7 +427,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         account_id = data.split(":", 1)[1]
         token = TOKENS.get(uid)
         if not token:
-            await q.edit_message_text("توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
+            await safe_edit(q, "توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
             return
         await show_worker_list(update, account_id, token)
 
@@ -404,11 +436,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cache = MANAGE_CACHE.get(uid)
         token = TOKENS.get(uid)
         if not token or not cache or cache.get("account_id") != account_id:
-            await q.edit_message_text("اطلاعات منقضی شده؛ دوباره وارد Manage Panel شو.", reply_markup=main_keyboard())
+            await safe_edit(q, "اطلاعات منقضی شده؛ دوباره وارد Manage Panel شو.", reply_markup=main_keyboard())
             return
         script = cache["scripts"].get(script_name)
         if not script:
-            await q.edit_message_text(
+            await safe_edit(q, 
                 "این Worker دیگر پیدا نشد؛ لیست به‌روزرسانی می‌شود.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data=f"workerback:{account_id}")]]),
             )
@@ -426,7 +458,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🗑 حذف", callback_data=f"workerdel:{account_id}:{script_name}")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data=f"workerback:{account_id}")],
         ])
-        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        await safe_edit(q, text, parse_mode="Markdown", reply_markup=keyboard)
 
     elif data.startswith("workerdel:"):
         _, account_id, script_name = data.split(":", 2)
@@ -434,7 +466,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("✅ تأیید حذف", callback_data=f"workerdelconfirm:{account_id}:{script_name}"),
             InlineKeyboardButton("لغو", callback_data=f"workerinfo:{account_id}:{script_name}"),
         ]])
-        await q.edit_message_text(
+        await safe_edit(q, 
             f"مطمئنی می‌خوای Worker `{script_name}` حذف بشه؟ این عملیات برگشت‌ناپذیر است.",
             parse_mode="Markdown", reply_markup=keyboard,
         )
@@ -443,24 +475,24 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, account_id, script_name = data.split(":", 2)
         token = TOKENS.get(uid)
         if not token:
-            await q.edit_message_text("توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
+            await safe_edit(q, "توکن پاک شده؛ دوباره واردش کن.", reply_markup=main_keyboard())
             return
         cf = Cloudflare(token)
         try:
-            await q.edit_message_text("در حال حذف Worker…")
+            await safe_edit(q, "در حال حذف Worker…")
             await cf.delete_script(account_id, script_name)
             cache = MANAGE_CACHE.get(uid)
             if cache and cache.get("account_id") == account_id:
                 cache["scripts"].pop(script_name, None)
-            await q.edit_message_text(
+            await safe_edit(q, 
                 f"✅ Worker `{script_name}` حذف شد.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به لیست", callback_data=f"workerback:{account_id}")]]),
             )
         except CloudflareError as e:
-            await q.edit_message_text(f"❌ Cloudflare: {e}", reply_markup=main_keyboard())
+            await safe_edit(q, f"❌ Cloudflare: {e}", reply_markup=main_keyboard())
         except Exception:
-            await q.edit_message_text("❌ حذف ناموفق بود.", reply_markup=main_keyboard())
+            await safe_edit(q, "❌ حذف ناموفق بود.", reply_markup=main_keyboard())
         finally:
             await cf.close()
 
@@ -468,11 +500,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = data.split(":", 1)[1]
         plan = PENDING.get(uid)
         if not plan or plan.get("action") != action:
-            await q.edit_message_text("درخواست منقضی شده؛ دوباره شروع کن.", reply_markup=main_keyboard())
+            await safe_edit(q, "درخواست منقضی شده؛ دوباره شروع کن.", reply_markup=main_keyboard())
             return
         cf = Cloudflare(plan["token"])
         try:
-            await q.edit_message_text("در حال انجام عملیات Cloudflare…")
+            await safe_edit(q, "در حال انجام عملیات Cloudflare…")
             await cf.deploy(plan["account_id"], plan["database_id"])
             if SUBSCRIPTION_USERNAME:
                 link = f"https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev/sub/{SUBSCRIPTION_USERNAME}"
@@ -483,22 +515,22 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"آدرس پایه: `https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev`\n"
                     f"الگوی اشتراک: `https://{SCRIPT_NAME}.{plan['subdomain']}.workers.dev/sub/USERNAME_IN_D1`"
                 )
-            await q.edit_message_text(
+            await safe_edit(q, 
                 result + "\n\n"
                 "USERNAME_IN_D1 باید نام کاربری واقعیِ موجود در D1 باشد؛ نام ورود پنل یا تلگرام نیست.",
                 parse_mode="Markdown", reply_markup=main_keyboard(), disable_web_page_preview=True,
             )
         except CloudflareError as e:
-            await q.edit_message_text(f"❌ Cloudflare: {e}", reply_markup=main_keyboard())
+            await safe_edit(q, f"❌ Cloudflare: {e}", reply_markup=main_keyboard())
         except Exception:
-            await q.edit_message_text("❌ عملیات کامل نشد.", reply_markup=main_keyboard())
+            await safe_edit(q, "❌ عملیات کامل نشد.", reply_markup=main_keyboard())
         finally:
             PENDING.pop(uid, None)
             await cf.close()
 
     elif data == "cancel":
         PENDING.pop(uid, None)
-        await q.edit_message_text("لغو شد.", reply_markup=main_keyboard())
+        await safe_edit(q, "لغو شد.", reply_markup=main_keyboard())
 
 
 async def clear_webhook(app: Application) -> None:
@@ -519,6 +551,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    logger.info("HusteRIX deploy bot starting…")
     app.run_polling(drop_pending_updates=True)
 
 
